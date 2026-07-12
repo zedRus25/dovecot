@@ -9,28 +9,32 @@ on:
 jobs:
   staging:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-latest
             container: debian:12
             distro: bookworm
+            arch: amd64
           - runner: ubuntu-24.04-arm
             container: debian:12
             distro: bookworm
+            arch: arm64
           - runner: ubuntu-latest
             container: debian:13
             distro: trixie
+            arch: amd64
           - runner: ubuntu-24.04-arm
             container: debian:13
             distro: trixie
+            arch: arm64
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     steps:
-      - name: install dependencies
+      - name: install packaging tools
         run: |
-          echo "MIRRORSITE=http://deb.debian.org/debian" > /etc/pbuilderrc
-          apt update
-          apt install -y git-buildpackage build-essential debhelper-compat default-libmysqlclient-dev krb5-multidev libapparmor-dev libbz2-dev libcap-dev libdb-dev libexpat-dev libexttextcat-dev libicu-dev libldap2-dev liblua5.4-dev liblz4-dev liblzma-dev libpam0g-dev libpq-dev libsasl2-dev libsodium-dev libsqlite3-dev libssl-dev libstemmer-dev libsystemd-dev libtirpc-dev libwrap0-dev libzstd-dev pkg-config zlib1g-dev git libunwind-dev rsync
+          apt-get update -q
+          apt-get install -y ca-certificates git git-buildpackage build-essential fakeroot rsync
 
       - uses: actions/checkout@v4
         with:
@@ -38,14 +42,37 @@ jobs:
           show-progress: false
           fetch-depth: 0
 
-      - name: build
+      # Install the build dependencies straight from debian/control, the same
+      # set a Debian buildd would resolve, instead of a hand-maintained list.
+      - name: install build dependencies
+        run: apt-get build-dep -y ./dovecot
+
+      # Debian buildds build as an unprivileged user (fakeroot for binary
+      # targets). This also matters for correctness: the upstream test suite
+      # (test-buffer-istream) fails when run as root, because root can read
+      # mode-0000 files.
+      - name: build (unit tests enabled)
         run: |
-          cd dovecot
-          git rm -r .github
-          git config --local user.name "test"
-          git config --local user.email "test@example.org"
-          git commit -am "CI: remove .github directory before building"
-          DEB_BUILD_OPTIONS=nocheck gbp buildpackage --git-no-pristine-tar --git-ignore-branch -us -uc
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          cat > /tmp/ci-build.sh <<'EOF'
+          set -ex
+          export HOME=/home/builder
+          cd "$GITHUB_WORKSPACE/dovecot"
+          git config --global user.name "test"
+          git config --global user.email "test@example.org"
+          git rm -rq .github
+          git commit -qam "CI: remove .github directory before building"
+          DEB_BUILD_OPTIONS="parallel=$(nproc)" gbp buildpackage --git-no-pristine-tar --git-ignore-branch -us -uc
+          EOF
+          runuser -u builder -- bash /tmp/ci-build.sh
+
+      - name: upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-area-${{ matrix.distro }}-${{ matrix.arch }}
+          path: build-area/
+          if-no-files-found: error
 
       - name: upload .deb files
         run: |
@@ -58,3 +85,139 @@ jobs:
             -e "ssh -i $HOME/.ssh/key -o StrictHostKeyChecking=no" \
             $GITHUB_WORKSPACE/build-area/ \
             "${{ secrets.USERNAME }}@download.delta.chat:/var/www/html/download/dovecot/staging/${safe_branch}/${{ matrix.distro }}/"
+
+  # Run the debian/tests suite (what ci.debian.net and salsa-ci run) against
+  # the freshly built packages. ci.debian.net uses lxc system containers with
+  # systemd as init; the closest GitHub Actions equivalent is a podman
+  # container booted with systemd (autopkgtest-virt-podman --init), one
+  # pristine testbed per test (needed because the usage/testmails tests are
+  # marked breaks-testbed and rewrite /etc/dovecot).
+  autopkgtest:
+    needs: staging
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            distro: bookworm
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            distro: bookworm
+            arch: arm64
+          - runner: ubuntu-latest
+            distro: trixie
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            distro: trixie
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: download built packages
+        uses: actions/download-artifact@v4
+        with:
+          name: build-area-${{ matrix.distro }}-${{ matrix.arch }}
+          path: build-area
+
+      - name: install autopkgtest and podman
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y autopkgtest podman
+
+      - name: build systemd-enabled testbed image
+        run: autopkgtest-build-podman --release ${{ matrix.distro }} --init systemd
+
+      # "command1" is the autopkgtest name of the run-parts Test-Command
+      # stanza in debian/tests/control (the debian/tests/usage scripts).
+      # --ignore-restrictions=breaks-testbed is safe because every test gets
+      # a fresh container.
+      - name: run autopkgtests
+        run: |
+          fail=0
+          for t in doveadm systemd command1 testmails; do
+            echo "::group::autopkgtest $t"
+            if ! autopkgtest --no-built-binaries \
+                --test-name="$t" \
+                --ignore-restrictions=breaks-testbed \
+                --output-dir="autopkgtest-out/$t" \
+                build-area/dovecot_*.changes \
+                -- podman "autopkgtest/systemd/debian:${{ matrix.distro }}"; then
+              echo "::error::autopkgtest $t failed on ${{ matrix.distro }}/${{ matrix.arch }}"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+      - name: upload autopkgtest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autopkgtest-logs-${{ matrix.distro }}-${{ matrix.arch }}
+          path: autopkgtest-out/
+
+  # Verify the build is reproducible. This is the salsa-ci reprotest job that
+  # Debian disables for dovecot ("The test suite does not pass reprotest") --
+  # but that failure was the test suite running as root, so with an
+  # unprivileged builder and nocheck (tests do not affect the shipped
+  # artifacts) the check is expected to pass. Variations mirror the salsa-ci
+  # defaults: -time (faketime is flaky), -build_path (buildds use a fixed
+  # path: /build/reproducible-path/...), -user_group/-domain_host (need sudo
+  # setup), -fileordering (disorderfs needs FUSE, unavailable in unprivileged
+  # containers), -aslr (blocked by the default docker seccomp profile).
+  reprotest:
+    needs: staging
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - container: debian:12
+            distro: bookworm
+          - container: debian:13
+            distro: trixie
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    steps:
+      - name: download built source package
+        uses: actions/download-artifact@v4
+        with:
+          name: build-area-${{ matrix.distro }}-amd64
+          path: build-area
+
+      - name: install reprotest and build dependencies
+        run: |
+          apt-get update -q
+          apt-get install -y reprotest locales-all dpkg-dev fakeroot
+          dpkg-source -x build-area/dovecot_*.dsc /tmp/dovecot-src
+          apt-get build-dep -y /tmp/dovecot-src
+
+      - name: run reprotest
+        run: |
+          useradd --create-home builder
+          install -d -o builder -g builder /build/reproducible-path
+          cp build-area/dovecot_*.dsc build-area/dovecot_*.tar.* /build/reproducible-path/
+          chown builder:builder /build/reproducible-path/*
+          cd /build/reproducible-path
+          runuser -u builder -- env HOME=/home/builder \
+            DEB_BUILD_OPTIONS="nocheck parallel=$(nproc)" \
+            reprotest --verbosity=1 --no-diffoscope \
+              --store-dir=/home/builder/reprotest-out \
+              --vary=-time \
+              --vary=-build_path \
+              --vary=-user_group \
+              --vary=-domain_host \
+              --vary=-fileordering \
+              --vary=-aslr \
+              dovecot_*.dsc -- null
+
+      - name: diffoscope on failure
+        if: failure()
+        run: |
+          apt-get install -y diffoscope-minimal
+          diffoscope --text - /home/builder/reprotest-out/control /home/builder/reprotest-out/experiment-1 || true
+
+      - name: upload reprotest output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reprotest-${{ matrix.distro }}
+          path: /home/builder/reprotest-out/
