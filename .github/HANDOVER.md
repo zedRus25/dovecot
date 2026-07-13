@@ -123,11 +123,33 @@ Backporting the debian-security changes is explicitly **out of scope** here
   their `.buildinfo` with `debrebuild` rather than rolling your own
   environment.
 
+## Lessons from the first pipeline run (run #1, 2026-07-12)
+
+Two failures, both fixed in commit `525ca0fd`:
+
+- **This fork has no git tags** (GitHub forks don't copy them), so gbp
+  could not build the orig tarball from `upstream/2.3.21+dfsg1`
+  (`gbp:error: ... is not a valid treeish`). The workflows now fall back
+  to `--git-upstream-tree=SLOPPY` (orig tarball = branch minus `debian/`)
+  when the tag is absent. Caveats: the generated orig tarball is not
+  byte-identical to Debian's dfsg tarball, and the `upstream/*` tag
+  trigger of build-deb.yml only fires once tags are actually pushed to
+  this repo — consider `git push origin 'refs/tags/upstream/*'` from a
+  clone that has them (e.g. from salsa or the chatmail repo), which also
+  makes gbp use the proper tag again.
+- **`apt-get install` hung for 6 h on debian:12**: git-buildpackage's
+  recommends pull in pbuilder, whose setup blocks without a preseeded
+  mirror — this is why the pre-rewrite workflow wrote
+  `MIRRORSITE=... > /etc/pbuilderrc`. Fixed properly with
+  `--no-install-recommends` (buildd-faithful anyway) +
+  `DEBIAN_FRONTEND=noninteractive`, plus `timeout-minutes` on every job
+  and a concurrency group cancelling superseded runs.
+
 ## Next steps
 
-1. **Watch run 29205496443** and fix what surfaces. Likely spots:
-   podman/systemd testbed on `ubuntu-24.04-arm`, reprotest variation
-   quirks, autopkgtest exit code 2 (skips) semantics.
+1. **Watch the current pipeline run** and fix what surfaces. Remaining
+   likely spots: podman/systemd testbed on `ubuntu-24.04-arm`, reprotest
+   variation quirks, autopkgtest exit code 2 (skips) semantics.
 2. Once green, consider making the `autopkgtest` + `reprotest` jobs
    required checks for PRs.
 3. Security backport (the original motivation for this fork's divergence):
