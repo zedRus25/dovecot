@@ -10,8 +10,17 @@ on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
+# Cancel superseded runs of the same branch/PR
+concurrency:
+  group: staging-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
 jobs:
   staging:
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -35,10 +44,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     steps:
+      # --no-install-recommends: buildds don't install recommends either, and
+      # git-buildpackage's recommends pull in pbuilder, whose setup hangs on
+      # debian:12 without a preseeded mirror.
       - name: install packaging tools
         run: |
           apt-get update -q
-          apt-get install -y ca-certificates git git-buildpackage build-essential fakeroot rsync
+          apt-get install -y --no-install-recommends ca-certificates git git-buildpackage build-essential fakeroot rsync openssh-client
 
       - uses: actions/checkout@v4
         with:
@@ -49,7 +61,7 @@ jobs:
       # Install the build dependencies straight from debian/control, the same
       # set a Debian buildd would resolve, instead of a hand-maintained list.
       - name: install build dependencies
-        run: apt-get build-dep -y ./dovecot
+        run: apt-get build-dep -y --no-install-recommends ./dovecot
 
       # Debian buildds build as an unprivileged user (fakeroot for binary
       # targets). This also matters for correctness: the upstream test suite
@@ -67,7 +79,16 @@ jobs:
           git config --global user.email "test@example.org"
           git rm -rq .github
           git commit -qam "CI: remove .github directory before building"
-          DEB_BUILD_OPTIONS="parallel=$(nproc)" gbp buildpackage --git-no-pristine-tar --git-ignore-branch -us -uc
+          # GitHub forks don't carry tags: if the upstream/<version> tag gbp
+          # would use for the orig tarball is missing, generate the tarball
+          # from the branch itself minus debian/ (SLOPPY).
+          uversion=$(dpkg-parsechangelog -SVersion | sed -e 's/^[0-9]*://' -e 's/-[^-]*$//')
+          tree_opt=""
+          if ! git rev-parse -q --verify "upstream/${uversion}^{commit}" >/dev/null; then
+            echo "tag upstream/${uversion} not found, using --git-upstream-tree=SLOPPY"
+            tree_opt="--git-upstream-tree=SLOPPY"
+          fi
+          DEB_BUILD_OPTIONS="parallel=$(nproc)" gbp buildpackage --git-no-pristine-tar --git-ignore-branch $tree_opt -us -uc
           EOF
           runuser -u builder -- bash /tmp/ci-build.sh
 
@@ -98,6 +119,7 @@ jobs:
   # marked breaks-testbed and rewrite /etc/dovecot).
   autopkgtest:
     needs: staging
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -170,6 +192,7 @@ jobs:
   # containers), -aslr (blocked by the default docker seccomp profile).
   reprotest:
     needs: staging
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -190,9 +213,9 @@ jobs:
       - name: install reprotest and build dependencies
         run: |
           apt-get update -q
-          apt-get install -y reprotest locales-all dpkg-dev fakeroot
+          apt-get install -y --no-install-recommends reprotest locales-all dpkg-dev fakeroot
           dpkg-source -x build-area/dovecot_*.dsc /tmp/dovecot-src
-          apt-get build-dep -y /tmp/dovecot-src
+          apt-get build-dep -y --no-install-recommends /tmp/dovecot-src
 
       - name: run reprotest
         run: |
