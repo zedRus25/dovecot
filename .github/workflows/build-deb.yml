@@ -80,7 +80,11 @@ jobs:
             echo "tag upstream/${uversion} not found, using --git-upstream-tree=SLOPPY"
             tree_opt="--git-upstream-tree=SLOPPY"
           fi
-          DEB_BUILD_OPTIONS="parallel=$(nproc)" gbp buildpackage --git-ignore-branch --git-no-pristine-tar $tree_opt -us -uc
+          # gbp's debian-branch defaults to 'master', which the CI checkout
+          # doesn't always create locally; use whatever is checked out (SLOPPY
+          # derives the upstream tree from the debian branch).
+          DEB_BUILD_OPTIONS="parallel=$(nproc)" gbp buildpackage --git-ignore-branch --git-no-pristine-tar \
+            --git-debian-branch="$(git rev-parse --abbrev-ref HEAD)" $tree_opt -us -uc
           EOF
           runuser -u builder -- bash /tmp/ci-build.sh
 
