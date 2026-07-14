@@ -1,3 +1,19 @@
+dovecot (1:2.3.21+dfsg1-3+chatmail1) unstable; urgency=medium
+
+  * chatmail downstream rebuild of Debian's 2.3.21 dovecot, held on both
+    bookworm (Debian stays at 2.3.19) and trixie (Debian has moved to the
+    incompatible 2.4). Installs are dpkg-pinned, so the +chatmailN suffix is a
+    monotonic downstream release marker, not an apt-ordering device.
+  * CI now mirrors Debian's build/test process: upstream unit tests,
+    debian/tests autopkgtest in Incus system containers, and a reprotest
+    reproducibility check.
+  * d/p/Skip-flaky-cpu-limit-tests.patch: disable the whole cpu-limit test-lib
+    suite. Its variants busy-loop until CPU accrues via getrusage/RLIMIT_CPU/
+    SIGXCPU, which is scheduler-dependent under CI: the SYSTEM cases hang on
+    arm64 and the USER nested case has hung on amd64, flaking between runs.
+
+ -- j4n <j4n@systemli.org>  Tue, 14 Jul 2026 09:43:42 +0200
+
 dovecot (1:2.3.21+dfsg1-3) unstable; urgency=medium
 
   * [883dc1a] Add libtirpc-dev to build-depends (Closes: #1065213)
